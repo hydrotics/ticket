@@ -1,28 +1,25 @@
+from __future__ import annotations
+
 import asyncio
 import json
 import os
 import sqlite3
+import sys
 from pathlib import Path
+from threading import Thread
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+from flask import Flask
 
 from config import BotConfig, ChannelConfig, TicketPromptConfig
-from support_controls import (
-    CLOSED_TICKETS_CATEGORY_NAME,
-    TRANSCRIPTS_CHANNEL_NAME,
-    ClosedTicketControlsView,
-    SupportControlsView,
-    configure_storage,
-    ensure_support_infrastructure,
-    hydrate_ticket_controls,
-    send_ticket_controls_message,
-    set_ticket_metadata,
-)
 
 load_dotenv()
+
+# Ensure "from main import ..." works even when this file is executed as a script.
+sys.modules.setdefault("main", sys.modules[__name__])
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -31,6 +28,22 @@ intents.guilds = True
 
 # Use empty string as prefix since we're using slash commands
 bot = commands.Bot(command_prefix="", intents=intents)
+
+# Flask app for keeping bot alive on Render
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    """Endpoint for UptimeRobot to ping - keeps bot alive"""
+    return "Bot is alive!", 200
+
+
+def run_flask():
+    """Run Flask server in a separate thread"""
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
 
 guild_configs: dict = {}
 ticket_counter_lock = asyncio.Lock()
@@ -70,7 +83,21 @@ def normalize_guild_config(config: dict) -> dict:
 
     config.setdefault("support_role", None)
     config.setdefault("setup_complete", False)
+    config.setdefault("transcript_channel_id", None)
     config.setdefault("ticket_prompt", create_default_ticket_prompt())
+    config.setdefault("ticket_categories", {})  # Maps ticket type value to category ID
+
+    channel_config = config.setdefault("channel_config", {})
+    if not isinstance(channel_config, dict):
+        channel_config = {}
+        config["channel_config"] = channel_config
+    for key, value in ChannelConfig.DEFAULT_GUILD_CHANNEL_CONFIG.items():
+        channel_config.setdefault(key, value)
+    channel_config.setdefault(
+        "prompt_channel_name",
+        channel_config.get("support_channel_name", ChannelConfig.SUPPORT_CHANNEL_NAME),
+    )
+
     ticket_prompt = config["ticket_prompt"]
     if not isinstance(ticket_prompt, dict):
         config["ticket_prompt"] = create_default_ticket_prompt()
@@ -84,6 +111,9 @@ def normalize_guild_config(config: dict) -> dict:
 
         if not isinstance(ticket_prompt["types"], list):
             ticket_prompt["types"] = [t.copy() for t in TicketPromptConfig.DEFAULT_TICKET_TYPES]
+
+    if not isinstance(config["ticket_categories"], dict):
+        config["ticket_categories"] = {}
 
     return config
 
@@ -148,14 +178,6 @@ def create_progress_bar(completed: int, total: int) -> str:
     filled = int((completed / total) * 20)
     bar = "█" * filled + "░" * (20 - filled)
     return f"[{bar}] {int(percentage)}%"
-
-
-def ordinal_suffix(number: int) -> str:
-    if 10 <= number % 100 <= 20:
-        suffix = "th"
-    else:
-        suffix = {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
-    return f"{number}{suffix}"
 
 
 def sanitize_channel_segment(text: str) -> str:
@@ -274,6 +296,11 @@ async def find_or_create_category(
 ) -> discord.CategoryChannel:
     existing = discord.utils.get(guild.categories, name=category_name)
     if existing:
+        if overwrites is not None:
+            try:
+                await existing.edit(overwrites=overwrites, reason="Ticket system setup")
+            except Exception:
+                pass
         return existing
     return await guild.create_category(
         name=category_name,
@@ -290,6 +317,10 @@ async def find_or_create_text_channel(
 ) -> discord.TextChannel:
     existing = discord.utils.get(guild.text_channels, name=channel_name)
     if existing:
+        try:
+            await existing.edit(category=category, overwrites=overwrites, reason="Ticket system setup")
+        except Exception:
+            pass
         return existing
     return await guild.create_text_channel(
         name=channel_name,
@@ -299,15 +330,124 @@ async def find_or_create_text_channel(
     )
 
 
+async def create_ticket_channel(interaction: discord.Interaction, ticket_info: dict) -> None:
+    """Create a new ticket channel for a user."""
+    guild = ticket_info.get("guild") or interaction.guild
+    creator = ticket_info.get("creator") or interaction.user
+    ticket_type = ticket_info.get("type", "general")
+    reason = ticket_info.get("reason", "")
+    reported_member = ticket_info.get("reported_member", "")
+
+    config = get_guild_config(guild.id)
+    support_role_id = config.get("support_role")
+    if not support_role_id:
+        await interaction.followup.send("Support role not configured.", ephemeral=True)
+        return
+
+    support_role = guild.get_role(support_role_id)
+    if not support_role:
+        await interaction.followup.send("Support role not found.", ephemeral=True)
+        return
+
+    ticket_number = await get_next_ticket_number(guild.id)
+    channel_name = build_ticket_channel_name(creator.name, ticket_number)
+
+    ticket_categories = config.get("ticket_categories", {})
+    category_id = ticket_categories.get(ticket_type)
+
+    category = None
+    if category_id:
+        maybe_category = guild.get_channel(int(category_id))
+        if isinstance(maybe_category, discord.CategoryChannel):
+            category = maybe_category
+
+    if not category:
+        default_category_name = f"{ticket_type.title()} Tickets"
+        overwrites = build_category_overwrites(guild, support_role, False)
+        category = await find_or_create_category(guild, default_category_name, overwrites)
+
+    overwrites = build_ticket_channel_overwrites(
+        guild, support_role, creator, creator_visible=True, default_visible=False
+    )
+
+    try:
+        ticket_channel = await find_or_create_text_channel(guild, channel_name, category, overwrites)
+    except Exception as e:
+        await interaction.followup.send(f"Error creating ticket channel: {str(e)}", ephemeral=True)
+        return
+
+    metadata = {
+        "state": "open",
+        "creator_id": creator.id,
+        "creator_name": creator.name,
+        "ticket_type": ticket_type,
+        "reason": reason,
+        "claimed_by_id": None,
+        "claimed_by_name": None,
+        "closed_by_id": None,
+        "original_category_id": category.id,
+    }
+
+    if reported_member:
+        metadata["reported_member"] = reported_member
+
+    from support_controls import set_ticket_metadata, send_ticket_controls_message
+
+    await set_ticket_metadata(ticket_channel, metadata)
+
+    info_embed = discord.Embed(
+        title="Ticket Information",
+        description=f"Ticket created by {creator.mention}",
+        color=discord.Color.blurple(),
+    )
+    info_embed.add_field(name="Type", value=ticket_type.capitalize(), inline=True)
+    info_embed.add_field(name="Creator ID", value=f"`{creator.id}`", inline=True)
+
+    if reason:
+        info_embed.add_field(name="Reason", value=str(reason)[:1024], inline=False)
+
+    if reported_member:
+        info_embed.add_field(name="Reported Member", value=str(reported_member)[:1024], inline=False)
+
+    await ticket_channel.send(embed=info_embed)
+
+    controls_message = await send_ticket_controls_message(ticket_channel, metadata)
+    metadata["controls_message_id"] = controls_message.id
+    await set_ticket_metadata(ticket_channel, metadata)
+
+    msg_content = f"Your ticket has been created: {ticket_channel.mention}"
+    if reason:
+        msg_content += f"\nReason: `{reason}`"
+
+    await interaction.followup.send(content=msg_content, ephemeral=True)
+
+
+# Import support/config modules after core helpers are defined.
+# This avoids circular import breakage when they import from main.
+from support_controls import (  # noqa: E402
+    CLOSED_TICKETS_CATEGORY_NAME,
+    TRANSCRIPTS_CHANNEL_NAME,
+    ClosedTicketControlsView,
+    SupportControlsView,
+    configure_storage,
+    ensure_support_infrastructure,
+    hydrate_ticket_controls,
+    send_ticket_controls_message,
+    set_ticket_metadata,
+)
+
+import config_command  # noqa: E402
+
+
 class RoleSelectView(discord.ui.View):
     def __init__(self, roles: list):
         super().__init__(timeout=600)
-        options = [discord.SelectOption(label=role.name, value=str(role.id)) for role in roles]
+        options = [discord.SelectOption(label=role.name, value=str(role.id)) for role in roles[:25]]
         select = discord.ui.Select(
             placeholder="Select a support role",
             options=options,
             min_values=1,
-            max_values=1
+            max_values=1,
         )
         select.callback = self.role_select_callback
         self.add_item(select)
@@ -326,251 +466,33 @@ class RoleSelectView(discord.ui.View):
 
         proceed_embed = discord.Embed(
             title="Ticket Setup",
-            description="Ready to create your ticket system.",
-            color=discord.Color.blurple()
+            description="Would you like to automatically set up all channels and categories?",
+            color=discord.Color.blurple(),
         )
         proceed_embed.add_field(name="Support Role", value=f"Selected: {role.mention}", inline=False)
 
-        proceed_view = SetupProceedView(interaction.guild)
+        proceed_view = AutoSetupPromptView(interaction.guild)
         await interaction.response.edit_message(embed=proceed_embed, view=proceed_view)
 
 
-class SetupProceedView(discord.ui.View):
+class AutoSetupPromptView(discord.ui.View):
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=600)
         self.guild = guild
 
-    @discord.ui.button(label="Proceed", style=discord.ButtonStyle.blurple)
-    async def proceed_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Yes - Auto Setup", style=discord.ButtonStyle.success)
+    async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
-        await setup_ticket_system(interaction, self.guild)
+        await auto_setup_ticket_system(interaction, self.guild)
+
+    @discord.ui.button(label="No - Manual Setup", style=discord.ButtonStyle.secondary)
+    async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        await manual_setup_ticket_system(interaction, self.guild)
 
 
-class TicketPromptConfigModal(discord.ui.Modal, title="Configure Ticket Prompt"):
-    title_input = discord.ui.TextInput(
-        label="Prompt Title",
-        placeholder="e.g., Create a Support Ticket",
-        default="Create a Support Ticket",
-        max_length=100
-    )
-
-    description_input = discord.ui.TextInput(
-        label="Prompt Description",
-        placeholder="e.g., Select a ticket type to get started",
-        default="Select a ticket type to get started",
-        max_length=500,
-        style=discord.TextStyle.long
-    )
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        config = get_guild_config(interaction.guild.id)
-        config["ticket_prompt"]["title"] = self.title_input.value
-        config["ticket_prompt"]["description"] = self.description_input.value
-        save_guild_configs()
-        await show_ticket_prompt_editor(interaction)
-
-
-class TicketTypeConfigModal(discord.ui.Modal, title="Add Ticket Type"):
-    type_name = discord.ui.TextInput(
-        label="Ticket Type Name",
-        placeholder="e.g., General Support",
-        max_length=100
-    )
-
-    type_value = discord.ui.TextInput(
-        label="Type Value (internal)",
-        placeholder="e.g., general",
-        max_length=50
-    )
-
-    type_category = discord.ui.TextInput(
-        label="Category Name (where tickets go)",
-        placeholder="e.g., General Tickets",
-        max_length=100
-    )
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-
-        config = get_guild_config(interaction.guild.id)
-        type_value = self.type_value.value.lower().strip()
-
-        existing_values = [t["value"].lower() for t in config["ticket_prompt"]["types"]]
-        if type_value in existing_values:
-            await interaction.followup.send(
-                f"A ticket type with value '{type_value}' already exists!",
-                ephemeral=True
-            )
-            return
-
-        new_type = {
-            "name": self.type_name.value.strip(),
-            "value": type_value,
-            "category": self.type_category.value.strip()
-        }
-        config["ticket_prompt"]["types"].append(new_type)
-        save_guild_configs()
-
-        await show_ticket_prompt_editor(interaction)
-
-
-class TicketCreationModal(discord.ui.Modal):
-    def __init__(self, ticket_type: str, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.ticket_type = ticket_type
-
-        self.reason_input = discord.ui.TextInput(
-            label="Reason for ticket",
-            placeholder="Describe your issue or request",
-            max_length=1000,
-            style=discord.TextStyle.long
-        )
-        self.add_item(self.reason_input)
-
-        if ticket_type == "report":
-            self.reported_member = discord.ui.TextInput(
-                label="Member ID or Username",
-                placeholder="e.g., username or ID",
-                max_length=100
-            )
-            self.add_item(self.reported_member)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-
-        ticket_info = {
-            "type": self.ticket_type,
-            "reason": self.reason_input.value.strip(),
-            "creator": interaction.user,
-            "guild": interaction.guild
-        }
-
-        if self.ticket_type == "report" and hasattr(self, "reported_member"):
-            ticket_info["reported_member"] = self.reported_member.value.strip()
-
-        await create_ticket_channel(interaction, ticket_info)
-
-
-class TicketTypeSelectView(discord.ui.View):
-    def __init__(self, ticket_types: list):
-        super().__init__(timeout=None)  # Persistent view
-
-        select_options = [
-            discord.SelectOption(
-                label=t["name"],
-                value=t["value"],
-                description=f"Category: {t['category']}"
-            )
-            for t in ticket_types
-        ]
-
-        select = discord.ui.Select(
-            placeholder="Select a ticket type",
-            options=select_options,
-            min_values=1,
-            max_values=1,
-            custom_id="ticket_type_select"  # Add custom_id for persistence
-        )
-        select.callback = self.ticket_type_callback
-        self.add_item(select)
-
-    async def ticket_type_callback(self, interaction: discord.Interaction):
-        ticket_type = interaction.data["values"][0]
-        modal = TicketCreationModal(ticket_type=ticket_type, title="Create Support Ticket")
-        await interaction.response.send_modal(modal)
-
-
-class TicketPromptEditView(discord.ui.View):
-    def __init__(self, interaction_user: discord.User):
-        super().__init__(timeout=900)
-        self.interaction_user = interaction_user
-
-    @discord.ui.button(label="Edit", style=discord.ButtonStyle.grey)
-    async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.interaction_user.id:
-            await interaction.response.send_message("You can't use this button.", ephemeral=True)
-            return
-        modal = TicketPromptConfigModal()
-        await interaction.response.send_modal(modal)
-
-    @discord.ui.button(label="Add Ticket Type", style=discord.ButtonStyle.blurple)
-    async def add_type_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.interaction_user.id:
-            await interaction.response.send_message("You can't use this button.", ephemeral=True)
-            return
-        modal = TicketTypeConfigModal()
-        await interaction.response.send_modal(modal)
-
-    @discord.ui.button(label="Send", style=discord.ButtonStyle.success)
-    async def send_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.interaction_user.id:
-            await interaction.response.send_message("You can't use this button.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        config = get_guild_config(interaction.guild.id)
-        ticket_types = config["ticket_prompt"]["types"]
-
-        if not ticket_types:
-            await interaction.followup.send(
-                "You need at least one ticket type before sending the prompt.",
-                ephemeral=True
-            )
-            return
-
-        create_ticket_channel = discord.utils.get(interaction.guild.text_channels, name="create-ticket")
-        if not create_ticket_channel:
-            await interaction.followup.send("Could not find create-ticket channel.", ephemeral=True)
-            return
-
-        try:
-            prompt_embed = create_ticket_prompt_embed(config["ticket_prompt"])
-            view = TicketTypeSelectView(ticket_types)
-            message = await create_ticket_channel.send(embed=prompt_embed, view=view)
-            config["ticket_prompt"]["message_id"] = message.id
-            config["ticket_prompt"]["channel_id"] = create_ticket_channel.id
-            save_guild_configs()
-
-            await interaction.followup.send("Ticket prompt sent successfully!", ephemeral=True)
-        except Exception as e:
-            await interaction.followup.send(f"Error sending prompt: {str(e)}", ephemeral=True)
-
-
-def create_ticket_prompt_embed(prompt_config: dict) -> discord.Embed:
-    embed = discord.Embed(
-        title=prompt_config["title"],
-        description=prompt_config["description"],
-        color=discord.Color.blurple()
-    )
-    embed.set_footer(text="Select a ticket type from the dropdown below")
-    return embed
-
-
-async def show_ticket_prompt_editor(interaction: discord.Interaction):
-    config = get_guild_config(interaction.guild.id)
-    types = config["ticket_prompt"]["types"]
-
-    if not types:
-        types_text = "No types added yet"
-    else:
-        types_text = "\n".join(f"{i}. {t['name']} (value: {t['value']})" for i, t in enumerate(types, 1))
-
-    editor_embed = discord.Embed(
-        title="Ticket Prompt Configuration",
-        description="Configure and customize your ticket creation prompt",
-        color=discord.Color.blurple()
-    )
-    editor_embed.add_field(name="Title", value=f"```{config['ticket_prompt']['title']}```", inline=False)
-    editor_embed.add_field(name="Description", value=f"```{config['ticket_prompt']['description']}```", inline=False)
-    editor_embed.add_field(name="Ticket Types", value=types_text, inline=False)
-
-    view = TicketPromptEditView(interaction.user)
-    await interaction.followup.send(embed=editor_embed, view=view, ephemeral=True)
-
-
-async def setup_ticket_system(interaction: discord.Interaction, guild: discord.Guild):
+async def auto_setup_ticket_system(interaction: discord.Interaction, guild: discord.Guild):
+    """Automatic setup with progress bar - creates all channels and categories"""
     config = get_guild_config(guild.id)
     support_role_id = config["support_role"]
 
@@ -587,7 +509,7 @@ async def setup_ticket_system(interaction: discord.Interaction, guild: discord.G
     progress_embed = discord.Embed(
         title="Ticket Setup",
         description="Creating your ticket system...",
-        color=discord.Color.blurple()
+        color=discord.Color.blurple(),
     )
     progress_embed.add_field(name="Progress", value=create_progress_bar(0, total_items), inline=False)
     progress_embed.add_field(name="Status", value="Initializing setup...", inline=False)
@@ -634,16 +556,32 @@ async def setup_ticket_system(interaction: discord.Interaction, guild: discord.G
         progress_embed.set_field_at(1, name="Status", value=f"Created {CLOSED_TICKETS_CATEGORY_NAME} and {TRANSCRIPTS_CHANNEL_NAME}", inline=False)
         await progress_message.edit(embed=progress_embed)
 
+        transcript_channel = discord.utils.get(guild.text_channels, name=TRANSCRIPTS_CHANNEL_NAME)
+        if transcript_channel:
+            config["transcript_channel_id"] = transcript_channel.id
+
+        for ticket_type in config["ticket_prompt"]["types"]:
+            for cat_name in ChannelConfig.TICKET_SYSTEM_STRUCTURE.keys():
+                if cat_name not in ["Support", "Logs"]:
+                    category = discord.utils.get(guild.categories, name=cat_name)
+                    if category and ticket_type["value"] not in config["ticket_categories"]:
+                        config["ticket_categories"][ticket_type["value"]] = category.id
+
         config["setup_complete"] = True
         save_guild_configs()
 
         completion_embed = discord.Embed(
-            title="Ticket Setup",
-            description="Your ticket system has been successfully created.",
-            color=discord.Color.green()
+            title="Ticket Setup Complete",
+            description="Your ticket system has been successfully created with auto setup.",
+            color=discord.Color.green(),
         )
         completion_embed.add_field(name="Progress", value=create_progress_bar(total_items, total_items), inline=False)
         completion_embed.add_field(name="Support Role", value=f"{support_role.mention}", inline=False)
+        completion_embed.add_field(
+            name="Next Step",
+            value="Use `/ticket-prompt` to configure and send the ticket creation prompt",
+            inline=False,
+        )
         completion_embed.set_footer(text=f"Setup completed by {interaction.user.name}")
 
         await progress_message.edit(embed=completion_embed)
@@ -651,98 +589,46 @@ async def setup_ticket_system(interaction: discord.Interaction, guild: discord.G
         error_embed = discord.Embed(
             title="Setup Failed",
             description=f"An error occurred: {str(e)}",
-            color=discord.Color.red()
+            color=discord.Color.red(),
         )
         error_embed.add_field(name="Progress", value=create_progress_bar(completed, total_items), inline=False)
         await progress_message.edit(embed=error_embed)
 
 
-async def create_ticket_channel(interaction: discord.Interaction, ticket_info: dict):
-    guild = ticket_info["guild"]
-    creator = ticket_info["creator"]
-    ticket_type = ticket_info["type"]
-
+async def manual_setup_ticket_system(interaction: discord.Interaction, guild: discord.Guild):
+    """Manual setup - user selects channels and categories"""
     config = get_guild_config(guild.id)
-    support_role_id = config["support_role"]
-    support_role = guild.get_role(support_role_id) if support_role_id else None
+    ticket_types = config["ticket_prompt"]["types"]
 
-    if not support_role:
-        await interaction.followup.send("Support role not found. Please run setup again.", ephemeral=True)
-        return
-
-    category = None
-    for t in config["ticket_prompt"]["types"]:
-        if t["value"] == ticket_type:
-            category_name = t["category"]
-            category = discord.utils.get(guild.categories, name=category_name)
-            break
-
-    if not category:
-        await interaction.followup.send("Could not find ticket category.", ephemeral=True)
-        return
-
-    try:
-        ticket_number = await get_next_ticket_number(guild.id)
-        channel_name = build_ticket_channel_name(creator.name, ticket_number)
-
-        overwrites = build_ticket_channel_overwrites(
-            guild,
-            support_role,
-            creator,
-            creator_visible=True,
-            default_visible=False,
+    if not ticket_types:
+        await interaction.followup.send(
+            "Default ticket types are ready. Select your channels and categories below.",
+            ephemeral=True,
         )
 
-        ticket_channel = await guild.create_text_channel(
-            name=channel_name,
-            category=category,
-            overwrites=overwrites,
-            reason=f"Ticket created by {creator.name}"
-        )
+    embed = discord.Embed(
+        title="Manual Setup",
+        description="Select the transcript channel and category for each ticket type",
+        color=discord.Color.blurple(),
+    )
 
-        ticket_embed = discord.Embed(
-            title="Support Ticket",
-            description=f"Ticket created by {creator.mention}",
-            color=discord.Color.blurple()
-        )
-        ticket_embed.add_field(name="Reason", value=ticket_info["reason"], inline=False)
-
-        if ticket_type == "report" and "reported_member" in ticket_info:
-            ticket_embed.add_field(name="Reported Member", value=ticket_info["reported_member"], inline=False)
-
-        ticket_embed.add_field(name="Type", value=ticket_type.capitalize(), inline=True)
-        ticket_embed.set_footer(text=f"Ticket ID: {ticket_channel.id}")
-
-        await ticket_channel.send(embed=ticket_embed)
-
-        controls_metadata = {
-            "state": "open",
-            "creator_id": creator.id,
-            "creator_name": creator.name,
-            "ticket_type": ticket_type,
-            "original_category_id": category.id,
-            "claimed_by_id": None,
-        }
-        controls_message = await send_ticket_controls_message(ticket_channel, controls_metadata)
-        controls_metadata["controls_message_id"] = controls_message.id
-        await set_ticket_metadata(ticket_channel, controls_metadata)
-
-        await interaction.followup.send(f"Ticket created: {ticket_channel.mention}", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"Error creating ticket: {str(e)}", ephemeral=True)
+    view = config_command.ChannelSelectView(guild, ticket_types)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 @bot.event
 async def on_ready():
+    """Initialize database and hydrate ticket controls on bot startup."""
+    print(f"{bot.user} has connected to Discord!")
     init_guild_config_database()
-    load_guild_configs()
     init_ticket_database()
+    load_guild_configs()
     configure_storage(get_guild_config, save_guild_configs)
 
     try:
         bot.add_view(SupportControlsView())
         bot.add_view(ClosedTicketControlsView())
-        bot.add_view(TicketTypeSelectView([]))  # Add persistent ticket type select view
+        bot.add_view(config_command.TicketTypeSelectView([], register_only=True))
     except Exception:
         pass
 
@@ -763,36 +649,34 @@ async def on_ready():
 @bot.tree.command(name="setup", description="Setup the ticket system for your server")
 @app_commands.default_permissions(administrator=True)
 async def setup_command(interaction: discord.Interaction):
-    # Check admin permissions
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("You must be an administrator to use this command.", ephemeral=True)
         return
 
-    # Check if setup is already complete
     config = get_guild_config(interaction.guild.id)
     if config.get("setup_complete"):
         await interaction.response.send_message(
-            "Ticket system has already been set up for this server. Use `/ticket-prompt` to configure prompts.",
-            ephemeral=True
+            "Ticket system has already been set up for this server. Use `/config` to make changes.",
+            ephemeral=True,
         )
         return
 
     role_embed = discord.Embed(
-        title="Ticket Setup",
+        title="Ticket Setup - Step 1",
         description="Select the support role for your ticket system",
-        color=discord.Color.blurple()
+        color=discord.Color.blurple(),
     )
     role_embed.add_field(
         name="Support Role",
         value="This role will have access to all support channels and ticket commands.",
-        inline=False
+        inline=False,
     )
 
     roles = [role for role in interaction.guild.roles if role != interaction.guild.default_role]
     if not roles:
         await interaction.response.send_message(
             "No roles available to select. Please create a role first.",
-            ephemeral=True
+            ephemeral=True,
         )
         return
 
@@ -800,51 +684,17 @@ async def setup_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=role_embed, view=view, ephemeral=True)
 
 
-@bot.tree.command(name="ticket-prompt", description="Configure and send the ticket creation prompt")
-@app_commands.default_permissions(administrator=True)
-async def ticket_prompt_command(interaction: discord.Interaction):
-    # Check admin permissions
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("You must be an administrator to use this command.", ephemeral=True)
-        return
-
-    config = get_guild_config(interaction.guild.id)
-    
-    # Check if setup is complete
-    if not config.get("setup_complete"):
-        await interaction.response.send_message(
-            "Please run `/setup` first to configure the ticket system.",
-            ephemeral=True
-        )
-        return
-
-    # Check if support role exists
-    if not config.get("support_role"):
-        await interaction.response.send_message(
-            "Support role not configured. Please run `/setup` first.",
-            ephemeral=True
-        )
-        return
-
-    modal = TicketPromptConfigModal()
-    await interaction.response.send_modal(modal)
-
-
-@bot.tree.command(name="ping", description="Check bot latency")
-async def ping_command(interaction: discord.Interaction):
-    latency = round(bot.latency * 1000)
-    ping_embed = discord.Embed(
-        title="Pong!",
-        description=f"Bot latency: {latency}ms",
-        color=discord.Color.blurple()
-    )
-    await interaction.response.send_message(embed=ping_embed, ephemeral=True)
-
-
 def main():
     token = os.getenv("DISCORD_TOKEN")
     if not token:
         raise ValueError("DISCORD_TOKEN not found in .env file")
+
+    # Start Flask web server in a separate thread to keep bot alive on Render
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print("Flask web server started on http://0.0.0.0:5000")
+
+    # Run Discord bot
     bot.run(token)
 
 
