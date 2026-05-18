@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import io
 import json
 import sqlite3
@@ -7,11 +9,13 @@ from typing import Any, Callable, Optional
 
 import discord
 
+from config import ChannelConfig
+
 _get_guild_config: Optional[Callable[[int], dict]] = None
 _save_guild_configs: Optional[Callable[[], None]] = None
 
-CLOSED_TICKETS_CATEGORY_NAME = "closed-tickets"
-TRANSCRIPTS_CHANNEL_NAME = "ticket-transcripts"
+CLOSED_TICKETS_CATEGORY_NAME = ChannelConfig.CLOSED_TICKETS_CATEGORY_NAME
+TRANSCRIPTS_CHANNEL_NAME = ChannelConfig.TRANSCRIPTS_CHANNEL_NAME
 TICKET_METADATA_DB_FILE = Path("ticket_metadata.db")
 
 __all__ = [
@@ -24,12 +28,17 @@ __all__ = [
     "DeleteConfirmView",
     "build_open_controls_embed",
     "build_closed_controls_embed",
+    "build_support_controls_view",
     "send_ticket_controls_message",
     "refresh_ticket_controls_message",
     "ensure_support_infrastructure",
     "hydrate_ticket_controls",
     "set_ticket_metadata",
     "get_ticket_metadata",
+    "delete_ticket_metadata",
+    "generate_transcript_file",
+    "is_support_member",
+    "sanitize_filename",
 ]
 
 
@@ -77,6 +86,41 @@ def _safe_json_dumps(data: dict) -> str:
     return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
 
 
+def _normalize_metadata(metadata: Any) -> dict:
+    if not isinstance(metadata, dict):
+        return {}
+
+    normalized = dict(metadata)
+
+    state = normalized.get("state", "open")
+    if state not in {"open", "closed"}:
+        normalized["state"] = "open"
+
+    for key in ("creator_id", "claimed_by_id", "closed_by_id", "controls_message_id", "original_category_id"):
+        value = normalized.get(key)
+        if value is None or value == "":
+            normalized[key] = None
+            continue
+        try:
+            normalized[key] = int(value)
+        except Exception:
+            normalized[key] = None
+
+    if not isinstance(normalized.get("ticket_type"), str):
+        normalized["ticket_type"] = str(normalized.get("ticket_type", "")).strip() or None
+
+    if not isinstance(normalized.get("creator_name"), str):
+        normalized["creator_name"] = None
+
+    if not isinstance(normalized.get("reason"), str):
+        normalized["reason"] = str(normalized.get("reason", "")).strip() or None
+
+    if not isinstance(normalized.get("reported_member"), str):
+        normalized["reported_member"] = str(normalized.get("reported_member", "")).strip() or None
+
+    return normalized
+
+
 def _load_metadata_from_db(channel_id: int) -> dict:
     with sqlite3.connect(TICKET_METADATA_DB_FILE) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -87,11 +131,11 @@ def _load_metadata_from_db(channel_id: int) -> dict:
         row = cur.fetchone()
         if not row:
             return {}
-        return _safe_json_loads(row[0])
+        return _normalize_metadata(_safe_json_loads(row[0]))
 
 
 def _save_metadata_to_db(channel: discord.TextChannel, metadata: dict) -> None:
-    payload = _safe_json_dumps(metadata)
+    payload = _safe_json_dumps(_normalize_metadata(metadata))
     now = datetime.now(timezone.utc).isoformat()
     with sqlite3.connect(TICKET_METADATA_DB_FILE) as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -122,9 +166,8 @@ def get_ticket_metadata(channel: discord.TextChannel) -> dict:
     if metadata:
         return metadata
 
-    # Legacy fallback: if an older ticket stored JSON in the channel topic, read it once.
-    # This does not write back to the topic.
     legacy = _safe_json_loads(channel.topic)
+    legacy = _normalize_metadata(legacy)
     if legacy:
         _save_metadata_to_db(channel, legacy)
     return legacy
@@ -140,7 +183,6 @@ def delete_ticket_metadata(channel: discord.TextChannel | int) -> None:
 
 
 def is_support_member(member: discord.Member, support_role_id: Optional[int]) -> bool:
-    """Check if member has the support role. Only support role members can use ticket controls."""
     if not support_role_id:
         return False
 
@@ -159,6 +201,33 @@ def sanitize_filename(name: str) -> str:
     return value or "ticket"
 
 
+def _parse_utc_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _discord_timestamp(value: Optional[str], style: str = "R") -> Optional[str]:
+    dt = _parse_utc_datetime(value)
+    if dt is None:
+        return None
+    return f"<t:{int(dt.timestamp())}:{style}>"
+
+
+def _add_claimed_by_field(embed: discord.Embed, metadata: dict) -> None:
+    claimed_by_id = metadata.get("claimed_by_id")
+    if claimed_by_id:
+        embed.add_field(name="Claimed by", value=f"<@{claimed_by_id}>", inline=True)
+    else:
+        embed.add_field(name="Claimed by", value="Unclaimed", inline=True)
+
+
 def build_open_controls_embed(channel: discord.TextChannel, metadata: dict) -> discord.Embed:
     embed = discord.Embed(
         title="Support Team Controls",
@@ -166,21 +235,7 @@ def build_open_controls_embed(channel: discord.TextChannel, metadata: dict) -> d
         color=discord.Color.blurple(),
     )
     embed.add_field(name="Status", value="Open", inline=True)
-
-    claimed_by_id = metadata.get("claimed_by_id")
-    if claimed_by_id:
-        embed.add_field(name="Claimed by", value=f"<@{claimed_by_id}>", inline=True)
-    else:
-        embed.add_field(name="Claimed by", value="Unclaimed", inline=True)
-
-    creator_id = metadata.get("creator_id")
-    if creator_id:
-        embed.add_field(name="Created by", value=f"<@{creator_id}>", inline=True)
-
-    ticket_type = metadata.get("ticket_type")
-    if ticket_type:
-        embed.add_field(name="Type", value=str(ticket_type).capitalize(), inline=True)
-
+    _add_claimed_by_field(embed, metadata)
     embed.set_footer(text=f"Channel: #{channel.name}")
     return embed
 
@@ -192,20 +247,22 @@ def build_closed_controls_embed(channel: discord.TextChannel, metadata: dict) ->
         color=discord.Color.dark_grey(),
     )
     embed.add_field(name="Status", value="Closed", inline=True)
+    _add_claimed_by_field(embed, metadata)
 
-    claimed_by_id = metadata.get("claimed_by_id")
-    if claimed_by_id:
-        embed.add_field(name="Claimed by", value=f"<@{claimed_by_id}>", inline=True)
-    else:
-        embed.add_field(name="Claimed by", value="Unclaimed", inline=True)
+    closed_by_id = metadata.get("closed_by_id")
+    if closed_by_id:
+        embed.add_field(name="Closed by", value=f"<@{closed_by_id}>", inline=True)
 
-    creator_id = metadata.get("creator_id")
-    if creator_id:
-        embed.add_field(name="Created by", value=f"<@{creator_id}>", inline=True)
-
-    ticket_type = metadata.get("ticket_type")
-    if ticket_type:
-        embed.add_field(name="Type", value=str(ticket_type).capitalize(), inline=True)
+    closed_at_live = _discord_timestamp(metadata.get("closed_at"), "R")
+    closed_at_full = _discord_timestamp(metadata.get("closed_at"), "F")
+    if closed_at_live and closed_at_full:
+        embed.add_field(
+            name="Closed at",
+            value=f"{closed_at_full} • {closed_at_live}",
+            inline=True,
+        )
+    elif closed_at_live:
+        embed.add_field(name="Closed at", value=closed_at_live, inline=True)
 
     embed.set_footer(text=f"Channel: #{channel.name}")
     return embed
@@ -224,41 +281,61 @@ async def _get_support_role(guild: discord.Guild) -> Optional[discord.Role]:
     return guild.get_role(role_id) if role_id else None
 
 
-async def _get_closed_category(guild: discord.Guild, support_role: discord.Role) -> discord.CategoryChannel:
+async def _ensure_closed_category(guild: discord.Guild, support_role: discord.Role) -> discord.CategoryChannel:
+    desired_overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        support_role: discord.PermissionOverwrite(view_channel=True),
+    }
+
     category = discord.utils.get(guild.categories, name=CLOSED_TICKETS_CATEGORY_NAME)
     if category:
+        try:
+            await category.edit(
+                overwrites=desired_overwrites,
+                reason="Ensure closed tickets category permissions",
+            )
+        except Exception:
+            pass
         return category
 
-    category = await guild.create_category(
+    return await guild.create_category(
         name=CLOSED_TICKETS_CATEGORY_NAME,
         reason="Create closed tickets category",
-        overwrites={
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            support_role: discord.PermissionOverwrite(view_channel=True),
-        },
+        overwrites=desired_overwrites,
     )
-    return category
 
 
-async def _get_transcripts_channel(guild: discord.Guild, support_role: discord.Role) -> discord.TextChannel:
+async def _ensure_transcripts_channel(guild: discord.Guild, support_role: discord.Role) -> discord.TextChannel:
+    desired_overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        support_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+        ),
+    }
+
     channel = discord.utils.get(guild.text_channels, name=TRANSCRIPTS_CHANNEL_NAME)
     if channel:
+        try:
+            await channel.edit(
+                overwrites=desired_overwrites,
+                reason="Ensure transcript channel permissions",
+            )
+        except Exception:
+            pass
         return channel
 
-    channel = await guild.create_text_channel(
+    return await guild.create_text_channel(
         name=TRANSCRIPTS_CHANNEL_NAME,
         reason="Create ticket transcripts channel",
-        overwrites={
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            support_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-        },
+        overwrites=desired_overwrites,
     )
-    return channel
 
 
 async def ensure_support_infrastructure(guild: discord.Guild, support_role: discord.Role) -> None:
-    await _get_closed_category(guild, support_role)
-    await _get_transcripts_channel(guild, support_role)
+    await _ensure_closed_category(guild, support_role)
+    await _ensure_transcripts_channel(guild, support_role)
 
 
 async def generate_transcript_file(channel: discord.TextChannel) -> discord.File:
@@ -267,6 +344,7 @@ async def generate_transcript_file(channel: discord.TextChannel) -> discord.File
         timestamp = message.created_at.replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         author = f"{message.author} ({message.author.id})"
         content = message.content or ""
+
         if message.attachments:
             attachments = "\n".join(
                 f"    attachment: {attachment.filename} -> {attachment.url}"
@@ -292,6 +370,7 @@ async def _persist_metadata(channel: discord.TextChannel, metadata: dict) -> Non
 
 
 async def send_ticket_controls_message(channel: discord.TextChannel, metadata: dict) -> discord.Message:
+    metadata = _normalize_metadata(metadata)
     closed = metadata.get("state") == "closed"
     claimed = bool(metadata.get("claimed_by_id"))
     embed = build_closed_controls_embed(channel, metadata) if closed else build_open_controls_embed(channel, metadata)
@@ -300,8 +379,9 @@ async def send_ticket_controls_message(channel: discord.TextChannel, metadata: d
 
 
 async def refresh_ticket_controls_message(channel: discord.TextChannel) -> None:
-    metadata = get_ticket_metadata(channel)
+    metadata = _normalize_metadata(get_ticket_metadata(channel))
     controls_message_id = metadata.get("controls_message_id")
+
     if not controls_message_id:
         message = await send_ticket_controls_message(channel, metadata)
         metadata["controls_message_id"] = message.id
@@ -324,7 +404,7 @@ async def refresh_ticket_controls_message(channel: discord.TextChannel) -> None:
 
 
 async def _archive_transcript(channel: discord.TextChannel, metadata: dict, support_role: discord.Role) -> None:
-    transcript_channel = await _get_transcripts_channel(channel.guild, support_role)
+    transcript_channel = await _ensure_transcripts_channel(channel.guild, support_role)
     file = await generate_transcript_file(channel)
     await transcript_channel.send(
         content=f"Created transcript for {channel.mention}",
@@ -338,9 +418,8 @@ async def _close_ticket(interaction: discord.Interaction) -> None:
         await interaction.followup.send("This can only be used in a ticket channel.", ephemeral=True)
         return
 
-    metadata = get_ticket_metadata(channel)
-    
-    # Check if ticket is already closed
+    metadata = _normalize_metadata(get_ticket_metadata(channel))
+
     if metadata.get("state") == "closed":
         await interaction.followup.send("This ticket is already closed.", ephemeral=True)
         return
@@ -357,9 +436,13 @@ async def _close_ticket(interaction: discord.Interaction) -> None:
     metadata["closed_at"] = datetime.now(timezone.utc).isoformat()
     metadata["closed_by_id"] = interaction.user.id
 
-    await _archive_transcript(channel, metadata, support_role)
+    transcript_warning = None
+    try:
+        await _archive_transcript(channel, metadata, support_role)
+    except Exception as exc:
+        transcript_warning = f"Transcript export failed: {exc}"
 
-    closed_category = await _get_closed_category(channel.guild, support_role)
+    closed_category = await _ensure_closed_category(channel.guild, support_role)
 
     overwrites = {
         channel.guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -384,7 +467,13 @@ async def _close_ticket(interaction: discord.Interaction) -> None:
     await _persist_metadata(channel, metadata)
     await refresh_ticket_controls_message(channel)
 
-    await interaction.followup.send("Ticket closed and archived.", ephemeral=True)
+    if transcript_warning:
+        await interaction.followup.send(
+            f"Ticket closed, but {transcript_warning}",
+            ephemeral=True,
+        )
+    else:
+        await interaction.channel.send("Ticket closed and archived to transcripts.")
 
 
 async def _reopen_ticket(interaction: discord.Interaction) -> None:
@@ -393,7 +482,7 @@ async def _reopen_ticket(interaction: discord.Interaction) -> None:
         await interaction.followup.send("This can only be used in a ticket channel.", ephemeral=True)
         return
 
-    metadata = get_ticket_metadata(channel)
+    metadata = _normalize_metadata(get_ticket_metadata(channel))
     support_role = await _get_support_role(channel.guild)
     if not support_role:
         await interaction.followup.send("Support role not configured.", ephemeral=True)
@@ -455,7 +544,7 @@ async def _claim_ticket(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("This can only be used in a ticket channel.", ephemeral=True)
         return
 
-    metadata = get_ticket_metadata(channel)
+    metadata = _normalize_metadata(get_ticket_metadata(channel))
     support_role = await _get_support_role(channel.guild)
     if not support_role:
         await interaction.response.send_message("Support role not configured.", ephemeral=True)
@@ -471,6 +560,7 @@ async def _claim_ticket(interaction: discord.Interaction) -> None:
 
     metadata["claimed_by_id"] = interaction.user.id
     metadata["claimed_by_name"] = interaction.user.display_name
+    metadata["claimed_at"] = datetime.now(timezone.utc).isoformat()
     await _persist_metadata(channel, metadata)
     await refresh_ticket_controls_message(channel)
 
@@ -611,7 +701,7 @@ async def hydrate_ticket_controls(bot: discord.Client) -> None:
     _require_storage()
     for guild in bot.guilds:
         for channel in guild.text_channels:
-            metadata = get_ticket_metadata(channel)
+            metadata = _normalize_metadata(get_ticket_metadata(channel))
             if metadata.get("controls_message_id"):
                 try:
                     await refresh_ticket_controls_message(channel)
