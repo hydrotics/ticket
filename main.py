@@ -6,7 +6,6 @@ import os
 import sqlite3
 import sys
 from pathlib import Path
-from threading import Thread
 
 import discord
 from discord import app_commands
@@ -29,21 +28,18 @@ intents.guilds = True
 # Use empty string as prefix since we're using slash commands
 bot = commands.Bot(command_prefix="", intents=intents)
 
-# Flask app for keeping bot alive on Render
+
+# =========================
+# Render + Gunicorn Web App
+# =========================
+
 app = Flask(__name__)
 
 
 @app.route("/")
 def home():
-    """Endpoint for UptimeRobot to ping - keeps bot alive"""
+    """Health check endpoint for Render/UptimeRobot"""
     return "Bot is alive!", 200
-
-
-def run_flask():
-    """Run Flask server in a separate thread"""
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
-
 
 guild_configs: dict = {}
 ticket_counter_lock = asyncio.Lock()
@@ -689,10 +685,6 @@ def main():
     if not token:
         raise ValueError("DISCORD_TOKEN not found in .env file")
 
-    # Start Flask web server in a separate thread to keep bot alive on Render
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print("Flask web server started on http://0.0.0.0:5000")
 
     # Run Discord bot
     bot.run(token)
