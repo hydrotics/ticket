@@ -41,6 +41,32 @@ def home():
     """Health check endpoint for Render/UptimeRobot"""
     return "Bot is alive!", 200
 
+# =========================
+# Render Production Bootstrap
+# =========================
+
+from threading import Thread
+import os
+
+def run_discord_bot():
+    """Starts the Discord bot safely in a background thread."""
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise ValueError("DISCORD_TOKEN not found in environment variables")
+
+    bot.run(token)
+
+
+# Start bot automatically when running on Render (Gunicorn import context)
+if os.getenv("RENDER"):
+    Thread(target=run_discord_bot, daemon=True).start()
+
+
+def main():
+    """Local development entrypoint only"""
+    run_discord_bot()
+
+
 guild_configs: dict = {}
 ticket_counter_lock = asyncio.Lock()
 TICKET_DB_FILE = Path("ticket_counters.db")
